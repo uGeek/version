@@ -1,0 +1,557 @@
+
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Visor de Versiones de Archivo</title>
+    <style>
+        body {
+            font-family: sans-serif;
+            margin: 20px;
+            background-color: #f4f4f4;
+            color: #333;
+        }
+        h1 {
+            color: #0056b3;
+        }
+        .controls {
+            margin-bottom: 20px;
+            padding: 10px;
+            background-color: #e9ecef;
+            border-radius: 4px;
+        }
+        .controls label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+        }
+        .controls input[type="text"] {
+            width: calc(100% - 22px); /* Ajuste para padding y borde */
+            padding: 8px;
+            margin-bottom: 10px;
+            border: 1px solid #ced4da;
+            border-radius: 4px;
+            box-sizing: border-box; /* Incluye padding y borde en el width */
+        }
+        #versionList {
+            list-style-type: none;
+            padding: 0;
+        }
+        #versionList li {
+            background-color: #fff;
+            border: 1px solid #ddd;
+            margin-bottom: 8px;
+            padding: 10px;
+            border-radius: 4px;
+            display: flex;
+            align-items: baseline;
+            flex-wrap: wrap;
+            cursor: pointer; /* Indica que es interactivo para el long press */
+        }
+        #versionList li.filtered-out {
+            display: none;
+        }
+        #versionList li a.file-name-link {
+            text-decoration: none;
+            color: #007bff;
+            font-weight: bold;
+            margin-right: 10px;
+        }
+        #versionList li a.file-name-link:hover {
+            text-decoration: underline;
+        }
+        .log-description {
+            color: #28a745;
+            margin-right: 10px;
+        }
+        .log-date {
+            color: #5a6268;
+            font-size: 0.9em;
+            margin-right: 10px;
+        }
+        .log-note {
+            color: #dc3545; /* Rojo para la nota */
+            font-style: italic;
+            font-size: 0.9em;
+        }
+        .status-message {
+            padding: 10px;
+            margin-top: 15px;
+            border-radius: 4px;
+        }
+        .status-message.error, .status-message.warning {
+            background-color: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+        .status-message.info {
+            background-color: #d1ecf1;
+            color: #0c5460;
+            border: 1px solid #bee5eb;
+        }
+        .status-message.success {
+            background-color: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+        .loader {
+            border: 5px solid #f3f3f3; /* Light grey */
+            border-radius: 50%;
+            border-top: 5px solid #3498db; /* Blue */
+            width: 30px;
+            height: 30px;
+            animation: spin 1s linear infinite;
+            margin: 20px auto;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body>
+    <h1>Versiones de: <span id="fileNameDisplay"></span></h1>
+
+    <div class="controls">
+        <label for="filterInput">Filtrar por texto:</label>
+        <input type="text" id="filterInput" placeholder="Escribe para filtrar...">
+
+        <label for="urlSuffixInput">Sufijo para URL al abrir:</label>
+        <input type="text" id="urlSuffixInput" placeholder="Ej: ?param=valor o #ancla">
+    </div>
+
+    <div id="status" class="status-message" style="display:none;"></div>
+    <div id="loader" class="loader" style="display:none;"></div>
+    <ul id="versionList"></ul>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', async function() {
+            const urlParams = new URLSearchParams(window.location.search);
+            const filePathParam = urlParams.get('archivo');
+            const fileNameDisplay = document.getElementById('fileNameDisplay');
+            const versionList = document.getElementById('versionList');
+            const statusDiv = document.getElementById('status');
+            const loader = document.getElementById('loader');
+            const filterInput = document.getElementById('filterInput');
+            const urlSuffixInput = document.getElementById('urlSuffixInput');
+
+            let globalLogData = {};
+            let allFilesFoundGlobally = [];
+            let longPressTimer = null;
+            const LONG_PRESS_DURATION = 2000; // 2 segundos
+            let baseNameGlobal = "";
+            let mdLogFilePathGlobal = ""; // Esta será la URL relativa o absoluta para el PUT
+            let fullFileNameGlobal = ""; 
+
+            function showStatus(message, type = 'info', autoHideDelay = 0) {
+                statusDiv.textContent = message;
+                statusDiv.className = `status-message ${type}`;
+                statusDiv.style.display = 'block';
+                if (type !== 'success' && type !== 'info' && type !== 'warning') {
+                    loader.style.display = 'none';
+                }
+                if (autoHideDelay > 0) {
+                    setTimeout(() => {
+                        if (statusDiv.textContent === message) { // Solo ocultar si el mensaje no ha cambiado
+                             hideStatus();
+                        }
+                    }, autoHideDelay);
+                }
+            }
+
+            function hideStatus() {
+                statusDiv.style.display = 'none';
+            }
+
+            if (!filePathParam) {
+                showStatus("Parámetro 'archivo=' no encontrado en la URL. Ejemplo: ?archivo=/dav/Notas/notas.html", 'error');
+                return;
+            }
+
+            const lastSlashIndex = filePathParam.lastIndexOf('/');
+            if (lastSlashIndex === -1) {
+                showStatus("Formato de 'archivo=' inválido. Debe ser una ruta completa, ej: /dav/Notas/notas.html", 'error');
+                return;
+            }
+
+            const directoryPath = filePathParam.substring(0, lastSlashIndex + 1);
+            fullFileNameGlobal = filePathParam.substring(lastSlashIndex + 1);
+            const dotIndex = fullFileNameGlobal.lastIndexOf('.');
+            baseNameGlobal = (dotIndex > -1) ? fullFileNameGlobal.substring(0, dotIndex) : fullFileNameGlobal;
+            const extension = (dotIndex > -1) ? fullFileNameGlobal.substring(dotIndex) : "";
+
+            fileNameDisplay.textContent = fullFileNameGlobal;
+            loader.style.display = 'block';
+            hideStatus();
+
+            // mdLogFilePathGlobal será la URL para leer y escribir el .md
+            // Asegúrate de que esta sea la URL correcta que tu servidor espera para PUT/GET
+            mdLogFilePathGlobal = directoryPath + baseNameGlobal + ".md"; 
+            
+            try {
+                globalLogData = await fetchAndParseMarkdownLog(mdLogFilePathGlobal);
+            } catch (error) {
+                console.warn(`No se pudo cargar o parsear el archivo de log ${mdLogFilePathGlobal}: ${error.message}`);
+                showStatus(`Advertencia: No se pudo cargar ${baseNameGlobal}.md. Descripciones/notas pueden no estar disponibles.`, 'warning', 5000);
+            }
+
+            const directoriesToScan = [directoryPath, directoryPath + ".backup/"];
+            let filesFromWebDAV = [];
+
+            const webdavPromises = directoriesToScan.map(dirUrl =>
+                fetchFilesFromWebDAV(dirUrl, baseNameGlobal, fullFileNameGlobal, extension)
+                    .then(files => filesFromWebDAV.push(...files))
+                    .catch(error => {
+                        if (!dirUrl.endsWith('.backup/')) console.error(`Error WebDAV ${dirUrl}: ${error.message}`);
+                        else console.warn(`WebDAV ${dirUrl} (backup) no encontrado o error: ${error.message}`);
+                    })
+            );
+
+            Promise.all(webdavPromises)
+                .then(() => {
+                    allFilesFoundGlobally = filesFromWebDAV;
+                    processAndDisplayFiles(allFilesFoundGlobally, fullFileNameGlobal, globalLogData);
+                })
+                .catch(err => {
+                    showStatus("Error procesando peticiones WebDAV.", "error");
+                    console.error("Error general en WebDAV:", err);
+                });
+
+
+            async function fetchAndParseMarkdownLog(mdFileUrl) { // Cambiado a mdFileUrl para claridad
+                const logEntries = {};
+                try {
+                    const response = await fetch(mdFileUrl, { cache: "no-store" }); // mdFileUrl es la URL completa
+                    if (response.ok) {
+                        const text = await response.text();
+                        const lines = text.split('\n');
+                        const logRegex = /^(\d+):\s*(.*?)\s+Fecha:\s*(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2})(?:\s*[–-]\s*Autor:\s*[^-\n]*?)?(?:\s*-\s*nota:\s*(.*?))?$/i;
+
+                        lines.forEach(line => {
+                            const match = line.trim().match(logRegex);
+                            if (match) {
+                                const version = parseInt(match[1], 10);
+                                const description = match[2].trim();
+                                const dateString = match[3].trim();
+                                const note = match[4] ? match[4].trim() : null;
+                                if (!isNaN(version)) {
+                                    logEntries[version] = { description, dateString, note, originalLine: line.trim() };
+                                }
+                            }
+                        });
+                    } else if (response.status === 404) {
+                        console.log(`Archivo de log ${mdFileUrl} no encontrado (404).`);
+                    } else {
+                        console.error(`Error ${response.status} al cargar ${mdFileUrl}.`);
+                    }
+                } catch (error) {
+                    console.error(`Error de red o parseo al cargar ${mdFileUrl}:`, error);
+                    throw error;
+                }
+                return logEntries;
+            }
+
+            function fetchFilesFromWebDAV(webdavDirUrl, baseFileName, originalFullFileName, fileExtension) {
+                return new Promise((resolve, reject) => {
+                    const xhr = new XMLHttpRequest();
+                    xhr.open("PROPFIND", webdavDirUrl, true);
+                    xhr.setRequestHeader("Depth", "1");
+                    xhr.setRequestHeader("Content-Type", "application/xml");
+
+                    xhr.onload = function() {
+                        if (xhr.status === 207) {
+                            const parser = new DOMParser();
+                            const xmlDoc = parser.parseFromString(xhr.responseText, "application/xml");
+                            const responses = xmlDoc.getElementsByTagNameNS("DAV:", "response");
+                            const foundFiles = [];
+
+                            for (let i = 0; i < responses.length; i++) {
+                                const hrefNode = responses[i].getElementsByTagNameNS("DAV:", "href")[0];
+                                if (hrefNode) {
+                                    let href = decodeURIComponent(hrefNode.textContent);
+                                    const itemNameInHref = href.substring(href.lastIndexOf('/') + 1);
+                                    if (href.endsWith('/') && (href === webdavDirUrl || href.startsWith(webdavDirUrl + "."))) continue; 
+                                    if (href.endsWith('/')) continue; 
+
+                                    const currentItemName = href.substring(href.lastIndexOf('/') + 1);
+                                    
+                                    if (currentItemName === originalFullFileName) {
+                                        foundFiles.push({ path: href, name: currentItemName, isBase: true, version: null });
+                                    } else {
+                                        const escapedBase = baseFileName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                                        const escapedExt = fileExtension.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                                        const versionRegex = new RegExp(`^${escapedBase}-v(\\d+)${escapedExt}$`, 'i');
+                                        const match = currentItemName.match(versionRegex);
+
+                                        if (match && match[1]) {
+                                            foundFiles.push({
+                                                path: href,
+                                                name: currentItemName,
+                                                isBase: false,
+                                                version: parseInt(match[1], 10)
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                            resolve(foundFiles);
+                        } else if (xhr.status === 404) {
+                             resolve([]);
+                        } else {
+                            reject(new Error(`Error ${xhr.status}: ${xhr.statusText} al acceder a ${webdavDirUrl}`));
+                        }
+                    };
+                    xhr.onerror = function() {
+                        reject(new Error(`Error de red al intentar acceder a ${webdavDirUrl}`));
+                    };
+                    xhr.send();
+                });
+            }
+
+            function renderListItem(file, logEntry) {
+                const li = document.createElement('li');
+                li.dataset.version = file.isBase ? 'base' : file.version;
+                li.dataset.filePath = file.path;
+
+                const a = document.createElement('a');
+                a.href = file.path; 
+                a.textContent = file.name;
+                a.target = "_blank";
+                a.classList.add('file-name-link');
+                
+                a.addEventListener('click', function(event) {
+                    event.preventDefault(); 
+                    if (longPressTimer) { 
+                        clearTimeout(longPressTimer);
+                        longPressTimer = null;
+                    }
+                    let targetUrl = file.path;
+                    const suffix = urlSuffixInput.value.trim();
+                    if (suffix) {
+                        if (targetUrl.includes('?')) {
+                            targetUrl += `&${suffix.startsWith('?') || suffix.startsWith('&') ? suffix.substring(1) : suffix}`;
+                        } else {
+                             targetUrl += `${(suffix.startsWith('?') || suffix.startsWith('#')) ? '' : '?'}${suffix}`;
+                        }
+                    }
+                    window.open(targetUrl, "_blank");
+                });
+                li.appendChild(a);
+
+                if (logEntry) {
+                    const descriptionSpan = document.createElement('span');
+                    descriptionSpan.textContent = logEntry.description;
+                    descriptionSpan.classList.add('log-description');
+                    li.appendChild(descriptionSpan);
+
+                    const dateSpan = document.createElement('span');
+                    dateSpan.textContent = logEntry.dateString;
+                    dateSpan.classList.add('log-date');
+                    li.appendChild(dateSpan);
+
+                    if (logEntry.note) {
+                        const noteSpan = document.createElement('span');
+                        noteSpan.textContent = ` - Nota: ${logEntry.note}`;
+                        noteSpan.classList.add('log-note');
+                        li.appendChild(noteSpan);
+                    }
+                }
+                if (!file.isBase) {
+                    addLongPressListener(li, file);
+                }
+                return li;
+            }
+
+            function processAndDisplayFiles(files, originalFullFileName, currentLogData) {
+                loader.style.display = 'none';
+                versionList.innerHTML = '';
+
+                if (!files || files.length === 0) {
+                    showStatus(`No se encontraron archivos o versiones para '${originalFullFileName}'.`, 'info');
+                    return;
+                }
+
+                const uniqueFiles = files.filter((file, index, self) =>
+                    index === self.findIndex((f) => f.path === file.path)
+                );
+
+                const baseFile = uniqueFiles.find(f => f.isBase && f.name === originalFullFileName);
+                const versionedFiles = uniqueFiles.filter(f => !f.isBase && typeof f.version === 'number');
+
+                versionedFiles.sort((a, b) => b.version - a.version);
+
+                const sortedFiles = [];
+                if (baseFile) sortedFiles.push(baseFile);
+                sortedFiles.push(...versionedFiles);
+
+                if (sortedFiles.length === 0) {
+                     showStatus(`No se encontraron versiones coincidentes para '${originalFullFileName}'.`, 'info');
+                     return;
+                }
+                
+                hideStatus();
+
+                sortedFiles.forEach(file => {
+                    const logEntry = (!file.isBase && file.version && currentLogData[file.version]) ? currentLogData[file.version] : null;
+                    const listItem = renderListItem(file, logEntry);
+                    versionList.appendChild(listItem);
+                });
+                applyFilter();
+                showStatus(`Se encontraron ${sortedFiles.length} archivo(s) / versiones.`, 'success', 3000);
+            }
+
+            function addLongPressListener(element, file) {
+                if (file.isBase || typeof file.version !== 'number') return;
+
+                const handlePressStart = (event) => {
+                    if (event.type === 'touchstart') event.preventDefault();
+                    
+                    clearTimeout(longPressTimer);
+                    longPressTimer = setTimeout(() => {
+                        longPressTimer = null;
+                        promptForNote(file.version, file.name);
+                    }, LONG_PRESS_DURATION);
+                };
+
+                const handlePressEnd = () => {
+                    if (longPressTimer) {
+                        clearTimeout(longPressTimer);
+                        longPressTimer = null;
+                    }
+                };
+
+                element.addEventListener('mousedown', handlePressStart);
+                element.addEventListener('mouseup', handlePressEnd);
+                element.addEventListener('mouseleave', handlePressEnd);
+                element.addEventListener('touchstart', handlePressStart, { passive: false });
+                element.addEventListener('touchend', handlePressEnd);
+                element.addEventListener('touchcancel', handlePressEnd);
+            }
+
+            function promptForNote(version, versionName) {
+                const currentLogEntry = globalLogData[version];
+                if (!currentLogEntry) {
+                    alert(`No se encontró una entrada de log base para la versión ${version} (${versionName}) en ${baseNameGlobal}.md. No se puede añadir/editar nota sin una entrada de log existente.`);
+                    return;
+                }
+
+                const currentNote = currentLogEntry.note || "";
+                const newNoteText = prompt(`Añadir/Editar nota para ${versionName}:`, currentNote);
+
+                if (newNoteText !== null) {
+                    const trimmedNewNote = newNoteText.trim();
+                    currentLogEntry.note = trimmedNewNote === "" ? null : trimmedNewNote;
+                    
+                    const listItem = versionList.querySelector(`li[data-version="${version}"]`);
+                    if (listItem) {
+                        let noteSpan = listItem.querySelector('.log-note');
+                        if (currentLogEntry.note) {
+                            if (!noteSpan) {
+                                noteSpan = document.createElement('span');
+                                noteSpan.classList.add('log-note');
+                                const dateSpan = listItem.querySelector('.log-date') || listItem.querySelector('.log-description') || listItem.querySelector('a.file-name-link');
+                                if (dateSpan) dateSpan.insertAdjacentElement('afterend', noteSpan);
+                            }
+                            noteSpan.textContent = ` - Nota: ${currentLogEntry.note}`;
+                        } else if (noteSpan) {
+                            noteSpan.remove();
+                        }
+                    }
+                    showStatus(`Nota para ${versionName} actualizada en la vista. Intentando guardar en servidor...`, 'info', 3000);
+                    
+                    saveMarkdownToServer(mdLogFilePathGlobal, globalLogData);
+                }
+            }
+            
+            async function saveMarkdownToServer(mdFileUrlToSave, logDataObject) { // mdFileUrlToSave es la URL del .md
+                let mdContent = "";
+                Object.keys(logDataObject).sort((a,b) => parseInt(a) - parseInt(b)).forEach(versionKey => {
+                    const entry = logDataObject[versionKey];
+                    let baseLine = "";
+
+                    if (entry.originalLine) {
+                        baseLine = entry.originalLine.replace(/\s*-\s*nota:\s*.*/i, '').trim();
+                    } else {
+                        baseLine = `${versionKey}: ${entry.description} Fecha: ${entry.dateString}`;
+                    }
+                    
+                    let finalLine = baseLine;
+                    if (entry.note && entry.note.trim() !== "") {
+                        finalLine += ` - nota: ${entry.note.trim()}`;
+                    }
+                    mdContent += finalLine + "\n";
+                });
+
+                console.log("Intentando guardar en el servidor...");
+                console.log("URL del archivo .md para PUT:", mdFileUrlToSave);
+                console.log("Contenido reconstruido a enviar:\n", mdContent.trimEnd());
+
+                // --------------- INICIO: SECCIÓN A CONFIGURAR PARA GUARDADO REAL ---------------
+                try {
+                    // **IMPORTANTE:** AJUSTA 'serverUrl' Y 'headers' SEGÚN TU SERVIDOR.
+                    // 'mdFileUrlToSave' (antes filePathOnServer) ya debería ser la URL correcta
+                    // si tu servidor permite PUT directo al archivo (ej. "/dav/Notas/tu_archivo.md").
+                    const serverUrl = mdFileUrlToSave; 
+
+                    // EJEMPLO: Si tienes un script de backend (PHP, Python, Node.js) que maneja el guardado:
+                    // const serverUrl = "/api/save_markdown.php"; // O la ruta a tu script
+                    // Y podrías necesitar enviar 'mdFileUrlToSave' como un parámetro en la URL o en el cuerpo.
+
+                    const response = await fetch(serverUrl, {
+                        method: 'PUT', // O 'POST', según tu servidor
+                        headers: {
+                            'Content-Type': 'text/markdown; charset=utf-8',
+                            // **DESCOMENTA Y AJUSTA SI NECESITAS AUTENTICACIÓN BÁSICA:**
+                            // 'Authorization': 'Basic ' + btoa('TU_USUARIO_WEBDAV:TU_CONTRASENA_WEBDAV'), 
+                        },
+                        body: mdContent.trimEnd()
+                    });
+
+                    if (response.ok) { // Código de estado 2xx indica éxito
+                        showStatus(`Nota guardada exitosamente en ${baseNameGlobal}.md en el servidor.`, 'success', 4000);
+                        console.log(`Archivo ${mdFileUrlToSave} guardado en el servidor. Respuesta:`, response.status, response.statusText);
+                        // Opcional: Volver a cargar los datos del log para asegurar la máxima consistencia
+                        // globalLogData = await fetchAndParseMarkdownLog(mdLogFilePathGlobal);
+                        // processAndDisplayFiles(allFilesFoundGlobally, fullFileNameGlobal, globalLogData);
+                    } else {
+                        const errorText = await response.text();
+                        showStatus(`Error al guardar en servidor (${response.status} ${response.statusText}). Detalles: ${errorText}`, 'error', 10000);
+                        console.error(`Error al guardar ${mdFileUrlToSave}: ${response.status} ${response.statusText}`, errorText);
+                    }
+                } catch (error) { // Errores de red (servidor no alcanzable, CORS, etc.)
+                    showStatus(`Error de red al intentar guardar en servidor: ${error.message}`, 'error', 10000);
+                    console.error('Error de red al guardar:', error);
+                }
+                // --------------- FIN: SECCIÓN A CONFIGURAR PARA GUARDADO REAL ---------------
+            }
+
+            filterInput.addEventListener('input', applyFilter);
+
+            function applyFilter() {
+                const filterText = filterInput.value.toLowerCase().trim();
+                const items = versionList.getElementsByTagName('li');
+                let visibleCount = 0;
+                for (let i = 0; i < items.length; i++) {
+                    const itemText = items[i].textContent.toLowerCase();
+                    if (itemText.includes(filterText)) {
+                        items[i].classList.remove('filtered-out');
+                        items[i].style.display = '';
+                        visibleCount++;
+                    } else {
+                        items[i].classList.add('filtered-out');
+                        items[i].style.display = 'none';
+                    }
+                }
+                if (items.length > 0) {
+                    if (visibleCount === 0 && filterText) {
+                        showStatus(`No hay coincidencias para "${filterText}".`, 'info');
+                    } else if (statusDiv.textContent.startsWith("No hay coincidencias") && (visibleCount > 0 || !filterText)) {
+                        hideStatus();
+                    }
+                }
+            }
+        });
+    </script>
+</body>
+</html>
